@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rtdx-yuzu-save-codec"
+version = "0.1.0"
+description = "Decode and encode Pokémon Mystery Dungeon: Rescue Team DX Yuzu save files."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["cryptography>=42.0.0"]
+license = {text = "MIT"}
+
+[project.scripts]
+rtdx-save-codec = "rtdx_save_codec:main"
+
+[tool.setuptools]
+py-modules = ["rtdx_save_codec"]
+package-dir = {"" = "src"}
