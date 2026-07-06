@@ -1,0 +1,312 @@
+name: Build standalone executables
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Also publish the built files to GitHub Releases"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+      release_tag:
+        description: "Release tag to use when publish_release is true"
+        required: false
+        default: "v0.1.0"
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.label }} standalone executable
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Windows
+            os: windows-latest
+            artifact_name: rtdx-save-codec-windows-standalone
+            binary_name: rtdx-save-codec.exe
+            archive_name: rtdx-save-codec-windows-standalone.zip
+          - label: macOS
+            os: macos-latest
+            artifact_name: rtdx-save-codec-macos-standalone
+            binary_name: rtdx-save-codec
+            archive_name: rtdx-save-codec-macos-standalone.tar.gz
+          - label: Linux
+            os: ubuntu-latest
+            artifact_name: rtdx-save-codec-linux-standalone
+            binary_name: rtdx-save-codec
+            archive_name: rtdx-save-codec-linux-standalone.tar.gz
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python for build runner only
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+
+      - name: Run source test suite
+        shell: bash
+        run: |
+          python -m pip install pytest
+          python -m pytest -q
+
+      - name: Build one-file standalone executable
+        shell: bash
+        run: |
+          pyinstaller \
+            --onefile \
+            --clean \
+            --name "rtdx-save-codec" \
+            --collect-all cryptography \
+            src/rtdx_save_codec.py
+
+      - name: Rename Windows executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path "dist/rtdx-save-codec.exe") {
+            Write-Host "Windows executable already has expected name."
+          } elseif (Test-Path "dist/rtdx-save-codec") {
+            Rename-Item "dist/rtdx-save-codec" "rtdx-save-codec.exe"
+          } else {
+            throw "Built executable was not found in dist/."
+          }
+
+      - name: Smoke test built executable with AES roundtrip
+        shell: bash
+        run: |
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            BIN="./dist/rtdx-save-codec.exe"
+          else
+            BIN="./dist/rtdx-save-codec"
+            chmod +x "$BIN"
+          fi
+
+          "$BIN" --help >/dev/null
+
+          PYTHONPATH=src python - <<'PY'
+          from pathlib import Path
+          import json
+          from rtdx_save_codec import (
+              ENCRYPT_TARGET_SIZE,
+              FINGERPRINT_SIZE,
+              JSON_LENGTH_OFFSET,
+              JSON_BODY_OFFSET,
+              encode_save,
+              sha256_hex,
+          )
+
+          key = b"PEGASUS939564968"
+
+          # The CLI validates the known RTDX JSON block by default.
+          # Build a deterministic fake plaintext save that contains a valid
+          # RTDX-like UTF-16LE JSON block so this smoke test exercises the
+          # same validation path users get with real saves.
+          payload = bytearray((i * 37 + 11) & 0xFF for i in range(ENCRYPT_TARGET_SIZE))
+          json_doc = {
+              "header_": {
+                  "dataVersion": 51,
+                  "dungeonSaveVersion": 10,
+                  "nativeVersion": 1,
+              },
+              "smokeTest": True,
+          }
+          json_body = json.dumps(json_doc, separators=(",", ":")).encode("utf-16le")
+          payload[JSON_LENGTH_OFFSET:JSON_LENGTH_OFFSET + 4] = len(json_body).to_bytes(4, "little")
+          payload[JSON_BODY_OFFSET:JSON_BODY_OFFSET + len(json_body)] = json_body
+
+          fingerprint = bytes((0xA5 ^ i) & 0xFF for i in range(FINGERPRINT_SIZE))
+          decoded = bytes(payload) + fingerprint
+          encrypted = encode_save(decoded, key)
+          Path("tmp_binary_test").mkdir(exist_ok=True)
+          Path("tmp_binary_test/decoded.bin").write_bytes(decoded)
+          Path("tmp_binary_test/encrypted.bin").write_bytes(encrypted)
+          Path("tmp_binary_test/original.sha256").write_text(sha256_hex(encrypted), encoding="utf-8")
+          PY
+
+          "$BIN" roundtrip tmp_binary_test/encrypted.bin --key PEGASUS939564968 --no-prompt -o tmp_binary_test/roundtrip.bin
+          "$BIN" decode tmp_binary_test/encrypted.bin --key PEGASUS939564968 --no-prompt -o tmp_binary_test/decoded_by_binary.bin
+          "$BIN" encode tmp_binary_test/decoded_by_binary.bin --key PEGASUS939564968 --no-prompt --fingerprint-from tmp_binary_test/encrypted.bin -o tmp_binary_test/reencoded_by_binary.bin
+
+          # Confirm the executable rejects an incorrect key instead of falsely
+          # passing due to AES decrypt/re-encrypt symmetry.
+          if "$BIN" roundtrip tmp_binary_test/encrypted.bin --key AAAAAAAAAAAAAAAA --no-prompt -o tmp_binary_test/wrong_key.bin; then
+            echo "Wrong key unexpectedly passed validation." >&2
+            exit 1
+          fi
+
+          PYTHONPATH=src python - <<'PY'
+          from pathlib import Path
+          from rtdx_save_codec import sha256_hex
+
+          original = Path("tmp_binary_test/encrypted.bin").read_bytes()
+          roundtrip = Path("tmp_binary_test/roundtrip.bin").read_bytes()
+          reencoded = Path("tmp_binary_test/reencoded_by_binary.bin").read_bytes()
+          decoded_expected = Path("tmp_binary_test/decoded.bin").read_bytes()
+          decoded_actual = Path("tmp_binary_test/decoded_by_binary.bin").read_bytes()
+          assert original == roundtrip, "binary roundtrip output differs from original"
+          assert original == reencoded, "binary re-encode differs from original"
+          assert decoded_expected == decoded_actual, "binary decoded output differs from expected plaintext"
+          print("binary_aes_roundtrip_sha256:", sha256_hex(roundtrip))
+          PY
+
+      - name: Create standalone notes
+        shell: bash
+        run: |
+          cat > STANDALONE_NOTES.txt <<'TXT'
+          This package contains a standalone PyInstaller executable.
+
+          The executable bundles Python and the runtime dependencies used by the codec.
+          End users do not need to install Python, pip, cryptography, or PyInstaller.
+
+          Windows:
+            rtdx-save-codec.exe --help
+
+          macOS/Linux:
+            chmod +x ./rtdx-save-codec
+            ./rtdx-save-codec --help
+
+          The first launch can be slower because one-file PyInstaller executables unpack to a temporary directory.
+          TXT
+
+      - name: Package Windows standalone executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force package | Out-Null
+          Copy-Item "dist/${{ matrix.binary_name }}" "package/${{ matrix.binary_name }}"
+          Copy-Item README.md package/README.md
+          Copy-Item LICENSE package/LICENSE
+          Copy-Item STANDALONE_NOTES.txt package/STANDALONE_NOTES.txt
+          Compress-Archive -Path package/* -DestinationPath "${{ matrix.archive_name }}" -Force
+
+      - name: Package macOS/Linux standalone executable
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p package
+          cp "dist/${{ matrix.binary_name }}" "package/${{ matrix.binary_name }}"
+          cp README.md package/README.md
+          cp LICENSE package/LICENSE
+          cp STANDALONE_NOTES.txt package/STANDALONE_NOTES.txt
+          tar -czf "${{ matrix.archive_name }}" -C package .
+
+      - name: Upload standalone executable artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.archive_name }}
+          if-no-files-found: error
+
+  bundle:
+    name: Bundle all standalone artifacts
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Create combined standalone bundle
+        shell: bash
+        run: |
+          mkdir -p bundle
+          find release-assets -maxdepth 3 -type f -exec cp {} bundle/ \;
+          (cd bundle && sha256sum * > SHA256SUMS.txt)
+          zip -r rtdx-save-codec-all-platforms-standalone.zip bundle
+
+      - name: Upload combined standalone bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rtdx-save-codec-all-platforms-standalone
+          path: rtdx-save-codec-all-platforms-standalone.zip
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: bundle
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish_release == 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+
+      - name: Prepare release assets
+        id: release_meta
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="${{ github.event.inputs.release_tag }}"
+          fi
+
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9._-]+)?$ ]]; then
+            echo "release_tag must look like v0.1.0, v1.2.3, or v1.2.3-beta.1" >&2
+            exit 1
+          fi
+
+          mkdir -p release-upload
+          find release-assets -type f \( -name '*.zip' -o -name '*.tar.gz' \) -exec cp {} release-upload/ \;
+
+          if ! ls release-upload/* >/dev/null 2>&1; then
+            echo "No release archives were produced." >&2
+            find release-assets -maxdepth 5 -type f -print >&2 || true
+            exit 1
+          fi
+
+          (cd release-upload && sha256sum * > SHA256SUMS.txt)
+
+          echo "Prepared files:"
+          ls -lah release-upload
+          echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update visible GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ steps.release_meta.outputs.tag_name }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG_NAME already exists. Updating assets."
+            gh release edit "$TAG_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "RTDX Save Codec $TAG_NAME" \
+              --notes "Standalone Windows, macOS, and Linux builds. These binaries bundle Python and do not require Python to be installed on the target system."
+          else
+            gh release create "$TAG_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "RTDX Save Codec $TAG_NAME" \
+              --notes "Standalone Windows, macOS, and Linux builds. These binaries bundle Python and do not require Python to be installed on the target system."
+          fi
+
+          gh release upload "$TAG_NAME" release-upload/* --repo "$GITHUB_REPOSITORY" --clobber
+
+          echo "Published release:"
+          gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" --json url,isDraft,isPrerelease,tagName,assets --jq '{tag: .tagName, draft: .isDraft, prerelease: .isPrerelease, url: .url, asset_count: (.assets | length)}'
